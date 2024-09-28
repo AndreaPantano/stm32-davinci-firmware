@@ -1,0 +1,154 @@
+#include <math.h>
+#include <string.h>
+
+// Kalman filter parameters
+float Q[3][3] = { {1.80293050e+09, 0.0, 0.0},
+                  {0.0, 2.12070154e+05, 0.0},
+                  {0.0, 0.0, 1.52358682e+05} }; // Process noise covariance
+
+float R[2][2] = { {16, 0},
+                  {0, 0.000225} }; // Measurement noise covariance
+
+float P[3][3] = { {1.0, 0.0, 0.0},
+                  {0.0, 1.0, 0.0},
+                  {0.0, 0.0, 1.0} }; // Initial state covariance
+
+float F[3][3] = { {1.0, dt, 0.5 * dt * dt},
+                  {0.0, 1.0, dt},
+                  {0.0, 0.0, 1.0} }; // State transition model
+
+float C[2][3] = { {1.0, 0.0, 0.0}, // Measurement matrix for altitude
+                  {0.0, 0.0, 1.0} }; // Measurement matrix for acceleration
+
+// Initial state
+float xp[3] = {0.0, 0.0, 0.0}; // State: [altitude, velocity, acceleration]
+float dt = 0.01; // Time step
+
+/* USER CODE BEGIN SensorsRead */
+UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+uint32_t tick;
+
+tick = osKernelGetTickCount();
+/* Infinite loop */
+for (;;)
+{
+    sensor_data data_1 = {0}, data_2 = {0};
+    uint8_t result = 1;
+
+    /* Retrieving data from sensors */
+    result = bmp3_get_sensor_data(BMP3_PRESS_TEMP, &barometer_data_1, &bmp390_1);
+    result |= bmp3_get_sensor_data(BMP3_PRESS_TEMP, &barometer_data_2, &bmp390_2);
+    result |= lsm6dso32_angular_rate_raw_get(&imu_1, data_raw_angular_rate_1);
+    result |= lsm6dso32_acceleration_raw_get(&imu_1, data_raw_acceleration_1);
+    result |= lsm6dso32_angular_rate_raw_get(&imu_2, data_raw_angular_rate_2);
+    result |= lsm6dso32_acceleration_raw_get(&imu_2, data_raw_acceleration_2);
+
+    /* Converting raw data */
+    for (int i = 0; i < 3; i++) {
+        angular_rate_mdps_1[i] = lsm6dso32_from_fs2000_to_mdps(data_raw_angular_rate_1[i]);
+        angular_rate_mdps_2[i] = lsm6dso32_from_fs2000_to_mdps(data_raw_angular_rate_2[i]);
+        acceleration_mg_1[i] = lsm6dso32_from_fs16_to_mg(data_raw_acceleration_1[i]);
+        acceleration_mg_2[i] = lsm6dso32_from_fs16_to_mg(data_raw_acceleration_2[i]);
+    }
+
+    /* Storing measurements to sensor_data variable */
+    data_1 = (sensor_data) {
+        .acc_x = acceleration_mg_1[0],
+        .acc_y = acceleration_mg_1[1],
+        .acc_z = acceleration_mg_1[2],
+        .dps_x = angular_rate_mdps_1[0],
+        .dps_y = angular_rate_mdps_1[1],
+        .dps_z = angular_rate_mdps_1[2],
+        .temperature = barometer_data_1.temperature,
+        .pressure = barometer_data_1.pressure,
+        .altitude = readAltitude(Pressure_1, data_1.pressure)
+    };
+
+    data_2 = (sensor_data) {
+        .acc_x = acceleration_mg_2[0],
+        .acc_y = acceleration_mg_2[1],
+        .acc_z = acceleration_mg_2[2],
+        .dps_x = angular_rate_mdps_2[0],
+        .dps_y = angular_rate_mdps_2[1],
+        .dps_z = angular_rate_mdps_2[2],
+        .temperature = barometer_data_2.temperature,
+        .pressure = barometer_data_2.pressure,
+        .altitude = readAltitude(Pressure_2, data_2.pressure)
+    };
+
+    /* Kalman filter implementation */
+    float z_IMU = data_1.acc_z; // Assuming acceleration z from IMU
+    float z_BARO = data_1.altitude; // Assuming altitude from barometer
+
+    // Prediction step
+    float xp_pred[3] = {
+        F[0][0] * xp[0] + F[0][1] * xp[1] + F[0][2] * xp[2], // Altitude
+        F[1][0] * xp[0] + F[1][1] * xp[1] + F[1][2] * xp[2], // Velocity
+        F[2][0] * xp[0] + F[2][1] * xp[1] + F[2][2] * xp[2]  // Acceleration
+    };
+
+    // Update covariance
+    float P_pred[3][3];
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            P_pred[i][j] = F[i][0] * P[0][j] + F[i][1] * P[1][j] + F[i][2] * P[2][j] + Q[i][j];
+        }
+    }
+
+    // Measurement update
+    float z[2] = {z_BARO, z_IMU}; // Measurement vector
+    float y[2] = {z[0] - (C[0][0] * xp_pred[0] + C[0][1] * xp_pred[1] + C[0][2] * xp_pred[2]),
+                  z[1] - (C[1][0] * xp_pred[0] + C[1][1] * xp_pred[1] + C[1][2] * xp_pred[2])}; // Measurement residual
+
+    // Compute the innovation covariance S
+    float S[2][2];
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 2; j++) {
+            S[i][j] = C[i][0] * P_pred[0][j] + C[i][1] * P_pred[1][j] + C[i][2] * P_pred[2][j] + R[i][j];
+        }
+    }
+
+    // Calculate the Kalman gain K
+    float K[3][2]; // Kalman gain
+    float S_inv[2][2]; // Inverse of S
+    // Calculate determinant
+    float det = S[0][0] * S[1][1] - S[0][1] * S[1][0];
+    // Calculate the inverse of S
+    S_inv[0][0] = S[1][1] / det;
+    S_inv[0][1] = -S[0][1] / det;
+    S_inv[1][0] = -S[1][0] / det;
+    S_inv[1][1] = S[0][0] / det;
+
+    // Calculate Kalman gain K
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 2; j++) {
+            K[i][j] = 0.0;
+            for (int k = 0; k < 3; k++) {
+                K[i][j] += P_pred[i][k] * C[j][k];
+            }
+            for (int k = 0; k < 2; k++) {
+                K[i][j] *= S_inv[j][k];
+            }
+        }
+    }
+
+    // Update state estimate
+    for (int i = 0; i < 3; i++) {
+        xp[i] = xp_pred[i] + K[i][0] * y[0] + K[i][1] * y[1];
+    }
+
+    // Update covariance
+    float P_updated[3][3];
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            P_updated[i][j] = P_pred[i][j];
+            for (int k = 0; k < 2; k++) {
+                P_updated[i][j] -= K[i][k] * C[k][j] * P_pred[i][j];
+            }
+        }
+    }
+    memcpy(P, P_updated, sizeof(P)); // Update the covariance matrix
+
+    /* Use xp (state estimate) here for further calculations or control actions */
+
+    /* ... Additional logic or data transmission
